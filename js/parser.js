@@ -11,9 +11,10 @@
    ============================================================ */
 
 const Parser = {
-  // Very small, dependency-free CSV parser that handles quoted
-  // fields and commas/newlines inside quotes.
-  parseCSV(text) {
+  // Very small, dependency-free delimited-text parser that handles
+  // quoted fields and delimiters/newlines inside quotes. Works for
+  // comma, tab, and semicolon separated files.
+  parseCSV(text, delimiter = ",") {
     const rows = [];
     let row = [];
     let field = "";
@@ -35,7 +36,7 @@ const Parser = {
       } else {
         if (c === '"') {
           inQuotes = true;
-        } else if (c === ",") {
+        } else if (c === delimiter) {
           row.push(field);
           field = "";
         } else if (c === "\n") {
@@ -56,6 +57,23 @@ const Parser = {
       rows.push(row);
     }
     return rows.filter((r) => r.some((cell) => String(cell).trim() !== ""));
+  },
+
+  // Look at the first few lines and figure out whether the file is
+  // separated by commas, tabs, or semicolons.
+  detectDelimiter(text) {
+    const sample = text.split("\n").slice(0, 5).join("\n");
+    const counts = {
+      "\t": (sample.match(/\t/g) || []).length,
+      ";": (sample.match(/;/g) || []).length,
+      ",": (sample.match(/,/g) || []).length,
+    };
+    let best = ",";
+    let bestCount = 0;
+    for (const [delim, count] of Object.entries(counts)) {
+      if (count > bestCount) { best = delim; bestCount = count; }
+    }
+    return best;
   },
 
   // Fields we try to map from the uploaded file to our lead record.

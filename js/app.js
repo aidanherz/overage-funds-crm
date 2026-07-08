@@ -350,7 +350,7 @@ const Views = {
       <div class="page-header">
         <div>
           <h1>Upload a Fund List</h1>
-          <p class="subtitle">Bring in a county or court surplus/excess funds list as a CSV file.</p>
+          <p class="subtitle">Bring in a county or court surplus/excess funds list — Excel, CSV, PDF, or any other file.</p>
         </div>
       </div>
 
@@ -384,12 +384,13 @@ const Views = {
 
         <h3 class="mt-16">Step 2 &middot; Upload the file</h3>
         <div class="field-hint mt-0" style="margin-bottom:10px;">
-          CSV or Excel (.xlsx/.xls) files both work.
+          Any file type is accepted — Excel, CSV, PDF, and other spreadsheet or text formats are read automatically.
+          (Scanned PDFs that are just a photo of a page can't be read — ask the county for a spreadsheet version of those.)
         </div>
         <div class="dropzone" id="dropzone">
           <div class="dz-icon">&#8593;</div>
           <div><strong>Drag &amp; drop your file here</strong>, or click to choose a file.</div>
-          <input type="file" id="file-input" accept=".csv,text/csv,.xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" />
+          <input type="file" id="file-input" />
         </div>
         <div id="upload-file-name" class="field-hint"></div>
       </div>
@@ -420,35 +421,131 @@ const Views = {
         fileInput.value = "";
         return;
       }
-      document.getElementById("upload-file-name").textContent = "Selected: " + file.name;
-      const isExcel = /\.(xlsx|xls)$/i.test(file.name);
-      const reader = new FileReader();
+      document.getElementById("upload-file-name").textContent = "Reading: " + file.name + "…";
 
-      reader.onload = () => {
-        let rows;
-        if (isExcel) {
-          const workbook = XLSX.read(reader.result, { type: "array" });
-          const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-          rows = XLSX.utils.sheet_to_json(firstSheet, { header: 1, raw: false, defval: "" })
-            .map((r) => r.map((cell) => (cell == null ? "" : String(cell))));
-        } else {
-          rows = Parser.parseCSV(reader.result);
-        }
-
-        if (rows.length < 2) {
-          alert("This file doesn't look like it has data rows. Please check the file and try again.");
-          return;
-        }
-        Views._renderMapping(file.name, rows, {
-          state: stateSel.value,
-          county: countyInput.value.trim(),
-          listType: document.getElementById("up-listtype").value,
+      Views._extractRows(file)
+        .then((rows) => {
+          if (!rows || rows.length < 2) {
+            document.getElementById("upload-file-name").textContent = "Selected: " + file.name;
+            alert("We could read this file, but couldn't find a table of data inside it (it needs a header row plus at least one lead). Please check the file and try again.");
+            return;
+          }
+          document.getElementById("upload-file-name").textContent = "Selected: " + file.name;
+          Views._renderMapping(file.name, rows, {
+            state: stateSel.value,
+            county: countyInput.value.trim(),
+            listType: document.getElementById("up-listtype").value,
+          });
+        })
+        .catch((err) => {
+          console.error("File read failed:", err);
+          document.getElementById("upload-file-name").textContent = "Selected: " + file.name;
+          alert(
+            "Sorry — we couldn't read that file as a list of leads.\n\n" +
+            "Files that work best: Excel (.xlsx/.xls), CSV, PDF, or other spreadsheet/text formats.\n\n" +
+            "If this is a scanned/photographed PDF (a picture of a page rather than real text), it can't be read automatically — try asking the county for a spreadsheet version."
+          );
         });
-      };
-
-      if (isExcel) reader.readAsArrayBuffer(file);
-      else reader.readAsText(file);
     }
+  },
+
+  // Turn ANY uploaded file into rows of cells, best-effort:
+  //   - PDFs: read the text and rebuild the table from word positions
+  //   - Spreadsheets (Excel, ODS, etc.): read via the SheetJS library
+  //   - Text (CSV/TSV/semicolons): detect the separator and parse
+  //   - Anything else: try spreadsheet first, then plain text
+  async _extractRows(file) {
+    const ext = (file.name.split(".").pop() || "").toLowerCase();
+
+    if (ext === "pdf") return Views._checkReadable(await Views._rowsFromPDF(file));
+
+    const textExts = ["csv", "tsv", "txt"];
+    if (textExts.includes(ext)) {
+      const text = await file.text();
+      return Views._checkReadable(Parser.parseCSV(text, Parser.detectDelimiter(text)));
+    }
+
+    // Everything else: let SheetJS try (it reads xlsx, xls, ods, and
+    // many older spreadsheet formats). If that fails, try plain text.
+    try {
+      const buf = await file.arrayBuffer();
+      const workbook = XLSX.read(buf, { type: "array" });
+      const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(firstSheet, { header: 1, raw: false, defval: "" })
+        .map((r) => r.map((cell) => (cell == null ? "" : String(cell))));
+      if (rows.length >= 2) return Views._checkReadable(rows);
+      throw new Error("No table found via spreadsheet reader");
+    } catch (e) {
+      const text = await file.text();
+      return Views._checkReadable(Parser.parseCSV(text, Parser.detectDelimiter(text)));
+    }
+  },
+
+  // Sanity check: if the "table" we extracted is mostly unreadable
+  // characters, the file was binary junk in disguise — reject it so the
+  // user gets a clear error instead of importing garbage leads.
+  _checkReadable(rows) {
+    const sample = rows.slice(0, 20).flat().join("").slice(0, 3000);
+    if (!sample) throw new Error("Empty table");
+    const junk = (sample.match(/[\u0000-\u0008\u000E-\u001F\uFFFD]/g) || []).length;
+    if (junk / sample.length > 0.05) throw new Error("File content is not readable text");
+    return rows;
+  },
+
+  // Rebuild table rows from a PDF's text. Words that sit on the same
+  // line become one row; a wide horizontal gap between words starts a
+  // new column. Best-effort — the preview step lets the user verify.
+  async _rowsFromPDF(file) {
+    if (!window.pdfjsLib) throw new Error("PDF library not loaded");
+    const buf = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+    const allRows = [];
+
+    for (let p = 1; p <= pdf.numPages; p++) {
+      const page = await pdf.getPage(p);
+      const content = await page.getTextContent();
+
+      // Group text pieces into lines by their vertical position.
+      const lines = [];
+      content.items.forEach((item) => {
+        if (!item.str || !item.str.trim()) return;
+        const x = item.transform[4];
+        const y = item.transform[5];
+        let line = lines.find((l) => Math.abs(l.y - y) <= 3);
+        if (!line) { line = { y, items: [] }; lines.push(line); }
+        line.items.push({ x, width: item.width || 0, str: item.str });
+      });
+
+      // Top of page first, then left-to-right within each line.
+      lines.sort((a, b) => b.y - a.y);
+      lines.forEach((line) => {
+        line.items.sort((a, b) => a.x - b.x);
+        const cells = [];
+        let current = null;
+        let prevEnd = null;
+        line.items.forEach((it) => {
+          if (current !== null && prevEnd !== null && it.x - prevEnd < 10) {
+            current += (current.endsWith(" ") || it.str.startsWith(" ") ? "" : " ") + it.str;
+          } else {
+            if (current !== null) cells.push(current.trim());
+            current = it.str;
+          }
+          prevEnd = it.x + it.width;
+        });
+        if (current !== null) cells.push(current.trim());
+        if (cells.length > 0) allRows.push(cells);
+      });
+    }
+
+    // Keep only rows that look like table rows (2+ columns), and pad
+    // them all to the same width so the mapping screen lines up.
+    const tableRows = allRows.filter((r) => r.length >= 2);
+    if (tableRows.length < 2) throw new Error("No table structure found in PDF");
+    const width = Math.max(...tableRows.map((r) => r.length));
+    return tableRows.map((r) => {
+      while (r.length < width) r.push("");
+      return r;
+    });
   },
 
   _renderMapping(filename, rows, ctx) {
