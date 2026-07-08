@@ -43,6 +43,7 @@ const Seed = {
       saleDate: "",
       overageAmount: 0,
       formerOwnerName: "",
+      businessName: "",
       status: "New",
       nextAction: "",
       responsible: "",

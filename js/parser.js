@@ -76,6 +76,23 @@ const Parser = {
     return best;
   },
 
+  // Does this "owner name" look like a business entity (LLC, Inc,
+  // Corp, Trust, etc.) rather than a person? Used at import time to
+  // route the name into the Business/LLC field instead.
+  isBusinessEntity(name) {
+    if (!name) return false;
+    const tokens = String(name).toUpperCase().replace(/[.,]/g, "").split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) return false;
+    const ENTITY_TOKENS = new Set([
+      "LLC", "PLLC", "INC", "INCORPORATED", "CORP", "CORPORATION",
+      "LP", "LLP", "LLLP", "LTD", "LIMITED", "COMPANY", "HOLDINGS",
+      "ENTERPRISES", "VENTURES", "PARTNERSHIP", "TRUST",
+    ]);
+    if (tokens.some((t) => ENTITY_TOKENS.has(t))) return true;
+    if (tokens[tokens.length - 1] === "CO") return true; // "SMITH & SONS CO"
+    return false;
+  },
+
   // Fields we try to map from the uploaded file to our lead record.
   TARGET_FIELDS: [
     { key: "propertyAddress", label: "Property Address", required: false },

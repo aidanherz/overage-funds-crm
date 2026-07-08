@@ -17,6 +17,18 @@ const US_STATES = [
 
 const LIST_TYPES = ["Surplus Funds", "Excess Funds", "Overbid", "Excess Proceeds", "Other"];
 
+const STATE_CODES = {
+  "Alabama":"AL","Alaska":"AK","Arizona":"AZ","Arkansas":"AR","California":"CA","Colorado":"CO",
+  "Connecticut":"CT","Delaware":"DE","Florida":"FL","Georgia":"GA","Hawaii":"HI","Idaho":"ID",
+  "Illinois":"IL","Indiana":"IN","Iowa":"IA","Kansas":"KS","Kentucky":"KY","Louisiana":"LA",
+  "Maine":"ME","Maryland":"MD","Massachusetts":"MA","Michigan":"MI","Minnesota":"MN","Mississippi":"MS",
+  "Missouri":"MO","Montana":"MT","Nebraska":"NE","Nevada":"NV","New Hampshire":"NH","New Jersey":"NJ",
+  "New Mexico":"NM","New York":"NY","North Carolina":"NC","North Dakota":"ND","Ohio":"OH","Oklahoma":"OK",
+  "Oregon":"OR","Pennsylvania":"PA","Rhode Island":"RI","South Carolina":"SC","South Dakota":"SD",
+  "Tennessee":"TN","Texas":"TX","Utah":"UT","Vermont":"VT","Virginia":"VA","Washington":"WA",
+  "West Virginia":"WV","Wisconsin":"WI","Wyoming":"WY","District of Columbia":"DC",
+};
+
 const STATUSES = [
   "New", "Researching", "Skip Tracing", "Attempting Contact", "Contact Made",
   "Docs Sent", "Awaiting Signature", "Notary Scheduled", "Signed",
@@ -90,10 +102,26 @@ const App = {
     await openDB();
     await Seed.maybeSeed();
     await App.reviveAgedLeads();
+    await App.migrateBusinessNames();
     await App.reloadAll();
     App.renderNav();
     window.addEventListener("hashchange", App.route);
     App.route();
+  },
+
+  // One-time tidy-up for leads imported before the Business/LLC field
+  // existed: if the "owner name" is clearly a business, move it over.
+  async migrateBusinessNames() {
+    const leads = await DB.getAllLeads();
+    for (const lead of leads) {
+      if (!lead.businessName && lead.formerOwnerName && Parser.isBusinessEntity(lead.formerOwnerName)) {
+        lead.businessName = lead.formerOwnerName;
+        lead.formerOwnerName = "";
+        if (lead.nextAction === "Begin research") lead.nextAction = "Find LLC owner";
+        lead.updatedAt = new Date().toISOString();
+        await DB.saveLead(lead);
+      }
+    }
   },
 
   async reloadAll() {
@@ -197,6 +225,16 @@ function statusBadge(status) {
   const cls = STATUS_BADGE_CLASS[status] || "badge-gray";
   return `<span class="badge ${cls}">${esc(status)}</span>`;
 }
+// How to show "who" a lead is: the person if we know them, otherwise
+// the business with an LLC tag, otherwise Unknown.
+function leadNameHTML(l) {
+  if (l.formerOwnerName) return esc(l.formerOwnerName);
+  if (l.businessName) return `${esc(l.businessName)} <span class="badge badge-amber">LLC / Business</span>`;
+  return "<span class='muted'>Unknown</span>";
+}
+function leadNameText(l) {
+  return l.formerOwnerName || l.businessName || "";
+}
 function groupLeadsByStateCounty(leads) {
   const tree = {};
   leads.forEach((l) => {
@@ -286,7 +324,7 @@ const Views = {
             <tbody>
               ${dueSoon.map((item) => `
                 <tr class="clickable" data-id="${item.lead.id}">
-                  <td>${esc(item.lead.formerOwnerName || item.lead.propertyAddress || "Unnamed lead")}<br/><span class="muted">${esc(item.lead.county)}, ${esc(item.lead.state)}</span></td>
+                  <td>${esc(leadNameText(item.lead) || item.lead.propertyAddress || "Unnamed lead")}<br/><span class="muted">${esc(item.lead.county)}, ${esc(item.lead.state)}</span></td>
                   <td><span class="badge badge-gray">${esc(item.type)}</span></td>
                   <td>${esc(item.label)}</td>
                   <td>${item._days < 0 ? `<span class="badge badge-red">Overdue ${Math.abs(item._days)}d</span>` : item._days === 0 ? `<span class="badge badge-amber">Today</span>` : `${fmtDate(item.date)}`}</td>
@@ -739,6 +777,20 @@ const Views = {
           reasons.push(`Source doesn't mention "Treasurer" — double-check this is a tax sale list (source: "${sourceOffice}")`);
         }
 
+        // Businesses (LLC, Inc, Trust, …) go in their own field — the
+        // Former Owner Name field is reserved for actual people.
+        const rawName = [get("formerOwnerName"), ...nameAppends.map((h) => r[headerIndex[h]] || "")]
+          .map((s) => String(s).trim()).filter(Boolean)
+          // skip parts already present (e.g. a Last Name column that
+          // repeats a surname the main column already contains)
+          .reduce((acc, part) => {
+            const seen = acc.join(" ").toUpperCase().split(/\s+/);
+            if (!part.split(/\s+/).every((w) => seen.includes(w.toUpperCase()))) acc.push(part);
+            return acc;
+          }, [])
+          .join(" ");
+        const isBusiness = Parser.isBusinessEntity(rawName);
+
         const lead = {
           id: uid("lead"),
           state: ctx.state,
@@ -749,10 +801,10 @@ const Views = {
           parcelNumber: get("parcelNumber"),
           saleDate: saleDateISO || "",
           overageAmount: amount == null ? 0 : amount,
-          formerOwnerName: [get("formerOwnerName"), ...nameAppends.map((h) => r[headerIndex[h]] || "")]
-            .map((s) => String(s).trim()).filter(Boolean).join(" "),
+          formerOwnerName: isBusiness ? "" : rawName,
+          businessName: isBusiness ? rawName : "",
           status: "New",
-          nextAction: evalResult.inRange ? "Begin research" : "",
+          nextAction: evalResult.inRange ? (isBusiness ? "Find LLC owner" : "Begin research") : "",
           responsible: "",
           dueDate: "",
           countyFollowUpDate: "",
@@ -823,7 +875,7 @@ const Views = {
       if (f.status && l.status !== f.status) return false;
       if (f.search) {
         const s = f.search.toLowerCase();
-        const hay = `${l.propertyAddress} ${l.parcelNumber} ${l.formerOwnerName} ${l.county} ${l.state}`.toLowerCase();
+        const hay = `${l.propertyAddress} ${l.parcelNumber} ${l.formerOwnerName} ${l.businessName || ""} ${l.county} ${l.state}`.toLowerCase();
         if (!hay.includes(s)) return false;
       }
       return true;
@@ -945,7 +997,7 @@ const Views = {
         <tbody>
           ${leads.map((l) => `
             <tr class="clickable" data-id="${l.id}">
-              <td>${esc(l.formerOwnerName) || "<span class='muted'>Unknown</span>"}${l.isDisqualified ? ` <span class="badge badge-red">Out of range</span>` : ""}</td>
+              <td>${leadNameHTML(l)}${l.isDisqualified ? ` <span class="badge badge-red">Out of range</span>` : ""}</td>
               <td>${esc(l.county)}, ${esc(l.state)}</td>
               <td>${fmtDate(l.saleDate)}</td>
               <td>${fmtMoney(l.overageAmount)}</td>
@@ -965,7 +1017,7 @@ const Views = {
     if (!county) return;
     const lead = {
       id: uid("lead"), state, county, listType: "Surplus Funds", sourceOffice: "",
-      propertyAddress: "", parcelNumber: "", saleDate: "", overageAmount: 0, formerOwnerName: "",
+      propertyAddress: "", parcelNumber: "", saleDate: "", overageAmount: 0, formerOwnerName: "", businessName: "",
       status: "New", nextAction: "", responsible: "", dueDate: "", countyFollowUpDate: "", claimantFollowUpDate: "",
       researchNotes: "", skipTraceNotes: "", badLeadReason: "", badLeadNotes: "",
       isDisqualified: false, disqualifyReasons: [],
@@ -1014,7 +1066,7 @@ const Views = {
           <tbody>
             ${archivedLeads.map((l) => `
               <tr>
-                <td class="clickable" data-id="${l.id}">${esc(l.formerOwnerName) || "<span class='muted'>Unknown</span>"}</td>
+                <td class="clickable" data-id="${l.id}">${leadNameHTML(l)}</td>
                 <td>${esc(l.county)}, ${esc(l.state)}</td>
                 <td>${fmtDate(l.saleDate)}</td>
                 <td>${fmtMoney(l.overageAmount)}</td>
@@ -1062,7 +1114,7 @@ const Views = {
     root.innerHTML = `
       <div class="page-header">
         <div>
-          <h1>${esc(lead.formerOwnerName) || "Unnamed Lead"}</h1>
+          <h1>${esc(leadNameText(lead)) || "Unnamed Lead"}</h1>
           <p class="subtitle">${esc(lead.county)}, ${esc(lead.state)} &middot; ${statusBadge(lead.status)} ${lead.isDisqualified ? `<span class="badge badge-red">Out of range</span>` : ""}</p>
         </div>
         <div class="flex gap-8">
@@ -1086,7 +1138,10 @@ const Views = {
               <div class="form-row"><label>Parcel #</label><input type="text" id="f-parcelNumber" value="${esc(lead.parcelNumber)}"/></div>
               <div class="form-row"><label>Sale Date</label><input type="date" id="f-saleDate" value="${esc(lead.saleDate)}"/></div>
               <div class="form-row"><label>Overage Amount</label><input type="number" id="f-overageAmount" value="${lead.overageAmount || 0}"/></div>
-              <div class="form-row"><label>Former Owner Name</label><input type="text" id="f-formerOwnerName" value="${esc(lead.formerOwnerName)}"/></div>
+              <div class="form-row"><label>Former Owner Name (person)</label><input type="text" id="f-formerOwnerName" value="${esc(lead.formerOwnerName)}"/>
+                ${lead.businessName && !lead.formerOwnerName ? `<div class="field-hint">Once you find who's behind the LLC, put their name here.</div>` : ""}
+              </div>
+              <div class="form-row"><label>Business / LLC Name</label><input type="text" id="f-businessName" value="${esc(lead.businessName || "")}"/></div>
               <div class="form-row"><label>Source / Office</label><input type="text" id="f-sourceOffice" value="${esc(lead.sourceOffice)}"/></div>
               <div class="form-row"><label>State</label><input type="text" id="f-state" value="${esc(lead.state)}"/></div>
               <div class="form-row"><label>County</label><input type="text" id="f-county" value="${esc(lead.county)}"/></div>
@@ -1099,6 +1154,8 @@ const Views = {
               Mark as disqualified / out of range
             </label>
           </div>
+
+          ${lead.businessName ? Views._llcResearchCardHTML(lead) : ""}
 
           <div class="card mt-16">
             <h2>Status &amp; Next Steps</h2>
@@ -1179,7 +1236,7 @@ const Views = {
     const fieldMap = [
       ["f-propertyAddress", "propertyAddress"], ["f-parcelNumber", "parcelNumber"],
       ["f-saleDate", "saleDate"], ["f-overageAmount", "overageAmount"],
-      ["f-formerOwnerName", "formerOwnerName"], ["f-sourceOffice", "sourceOffice"],
+      ["f-formerOwnerName", "formerOwnerName"], ["f-businessName", "businessName"], ["f-sourceOffice", "sourceOffice"],
       ["f-state", "state"], ["f-county", "county"], ["f-listType", "listType"],
       ["f-status", "status"], ["f-nextAction", "nextAction"], ["f-responsible", "responsible"],
       ["f-dueDate", "dueDate"], ["f-countyFollowUpDate", "countyFollowUpDate"], ["f-claimantFollowUpDate", "claimantFollowUpDate"],
@@ -1193,7 +1250,7 @@ const Views = {
       el.addEventListener(evtType, async () => {
         lead[key] = el.type === "number" ? parseFloat(el.value) || 0 : el.value;
         await persistLead(lead);
-        if (elId === "f-status" || elId === "f-state" || elId === "f-county") Views.leadDetail(root, id);
+        if (elId === "f-status" || elId === "f-state" || elId === "f-county" || elId === "f-businessName") Views.leadDetail(root, id);
       });
     });
 
@@ -1263,6 +1320,35 @@ const Views = {
         Views.leadDetail(root, id);
       });
     });
+  },
+
+  // Research links for finding the person behind an LLC. Fully
+  // automatic lookup isn't possible for free (OpenCorporates' API needs
+  // a paid key and state registries block automated tools), so instead
+  // each link opens the right search, pre-filled, in a new tab.
+  _llcResearchCardHTML(lead) {
+    const name = encodeURIComponent(lead.businessName);
+    const code = STATE_CODES[lead.state] || "";
+    const jurisdiction = code ? `&jurisdiction_code=us_${code.toLowerCase()}` : "";
+    const openCorp = `https://opencorporates.com/companies?q=${name}${jurisdiction}&type=companies`;
+    const sosSearch = `https://www.google.com/search?q=${encodeURIComponent(`${lead.state} Secretary of State business search "${lead.businessName}"`)}`;
+    const generalSearch = `https://www.google.com/search?q=${encodeURIComponent(`"${lead.businessName}" ${lead.state} owner registered agent`)}`;
+    return `
+      <div class="card mt-16">
+        <h2>Find the LLC's Owner</h2>
+        <p class="field-hint mt-0">
+          This lead's claimant is a business: <strong>${esc(lead.businessName)}</strong>.
+          These searches open pre-filled in a new tab — look for the <em>registered agent</em>,
+          <em>organizer</em>, or <em>officers</em> on the state filing. When you find the person,
+          enter them under Former Owner Name above.
+        </p>
+        <div class="flex gap-8 wrap">
+          <a class="btn" href="${openCorp}" target="_blank" rel="noopener">Search OpenCorporates</a>
+          <a class="btn" href="${sosSearch}" target="_blank" rel="noopener">Find ${esc(lead.state) || "State"} Business Registry</a>
+          <a class="btn" href="${generalSearch}" target="_blank" rel="noopener">Google the Owner</a>
+        </div>
+      </div>
+    `;
   },
 
   _milestonesHTML(lead) {
