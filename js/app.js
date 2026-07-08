@@ -79,7 +79,24 @@ const DEFAULT_SETTINGS = {
   minAmount: 1000,
   minAgeMonths: 6,
   maxAgeYears: 5,
+  commissionPctUnder: 0, // % of overage when amount is under $100k
+  commissionPctOver: 0,  // % of overage when amount is $100k or more
 };
+
+const COMMISSION_THRESHOLD = 100000;
+
+// Statuses where the money has actually come in.
+const RECEIVED_STATUSES = ["Check Received", "Check Sent to Claimant", "Closed - Paid"];
+
+// Commission for one lead: the whole overage earns one rate, picked by
+// which side of the $100k line the amount falls on.
+function commissionFor(lead) {
+  const amt = Number(lead.overageAmount) || 0;
+  const pct = amt >= COMMISSION_THRESHOLD
+    ? (App.settings.commissionPctOver || 0)
+    : (App.settings.commissionPctUnder || 0);
+  return amt * (pct / 100);
+}
 
 const NAV_ITEMS = [
   { route: "dashboard", label: "Dashboard", icon: "▦" },
@@ -281,6 +298,15 @@ const Views = {
     const closedWon = App.leads.filter((l) => l.status === "Closed - Paid");
     const closedValue = closedWon.reduce((sum, l) => sum + (Number(l.overageAmount) || 0), 0);
 
+    // Commission: "received" once the check is in hand (or beyond);
+    // everything else still being worked is "potential".
+    const receivedLeads = active.filter((l) => RECEIVED_STATUSES.includes(l.status));
+    const commissionReceived = receivedLeads.reduce((sum, l) => sum + commissionFor(l), 0);
+    const commissionPotential = active
+      .filter((l) => !RECEIVED_STATUSES.includes(l.status))
+      .reduce((sum, l) => sum + commissionFor(l), 0);
+    const commissionConfigured = (App.settings.commissionPctUnder || 0) > 0 || (App.settings.commissionPctOver || 0) > 0;
+
     const dueItems = [];
     active.forEach((l) => {
       if (l.dueDate) dueItems.push({ lead: l, label: l.nextAction || "Next action", date: l.dueDate, type: "Next Action" });
@@ -313,7 +339,15 @@ const Views = {
         <div class="stat-card"><div class="value">${badLeads.length}</div><div class="label">Bad Leads</div></div>
         <div class="stat-card"><div class="value">${closedWon.length}</div><div class="label">Closed &amp; Paid</div></div>
         <div class="stat-card"><div class="value">${fmtMoney(closedValue)}</div><div class="label">Total Paid Out Value</div></div>
+        <div class="stat-card"><div class="value" style="color:var(--accent-dark);">${fmtMoney(commissionReceived)}</div><div class="label">Commission Received</div></div>
+        <div class="stat-card"><div class="value">${fmtMoney(commissionPotential)}</div><div class="label">Potential Commission (Pipeline)</div></div>
       </div>
+
+      ${!commissionConfigured ? `
+        <div class="banner banner-info">
+          Commission tracking is on, but your rates aren't set yet — enter your percentages in
+          <a href="#/settings">Settings → Commission Rules</a> and these numbers will fill in automatically.
+        </div>` : ""}
 
       <div class="two-col">
         <div class="card">
@@ -992,7 +1026,7 @@ const Views = {
     return `
       <table>
         <thead>
-          <tr><th>Owner</th><th>Location</th><th>Sale Date</th><th>Amount</th><th>Status</th><th>Next Action</th></tr>
+          <tr><th>Owner</th><th>Location</th><th>Sale Date</th><th>Amount</th><th>Your Commission</th><th>Status</th><th>Next Action</th></tr>
         </thead>
         <tbody>
           ${leads.map((l) => `
@@ -1001,6 +1035,7 @@ const Views = {
               <td>${esc(l.county)}, ${esc(l.state)}</td>
               <td>${fmtDate(l.saleDate)}</td>
               <td>${fmtMoney(l.overageAmount)}</td>
+              <td>${commissionFor(l) > 0 ? `<strong>${fmtMoney(commissionFor(l))}</strong>` : "<span class='muted'>—</span>"}</td>
               <td>${statusBadge(l.status)}${l.status === "Bad Lead" && l.badLeadReason ? `<div class="field-hint">${esc(l.badLeadReason)}</div>` : ""}</td>
               <td>${esc(l.nextAction) || "—"}</td>
             </tr>
@@ -1149,6 +1184,11 @@ const Views = {
                 <select id="f-listType">${LIST_TYPES.map((t) => `<option ${lead.listType === t ? "selected" : ""}>${esc(t)}</option>`).join("")}</select>
               </div>
             </div>
+            ${commissionFor(lead) > 0 ? `
+              <div class="banner banner-success" style="margin:10px 0 0 0;">
+                Your commission on this lead: <strong>${fmtMoney(commissionFor(lead))}</strong>
+                (${(Number(lead.overageAmount) || 0) >= COMMISSION_THRESHOLD ? App.settings.commissionPctOver : App.settings.commissionPctUnder}% of ${fmtMoney(lead.overageAmount)})
+              </div>` : ""}
             <label style="display:flex;align-items:center;gap:6px;font-weight:400;color:var(--text);margin-top:10px;">
               <input type="checkbox" id="f-isDisqualified" style="width:auto;" ${lead.isDisqualified ? "checked" : ""}/>
               Mark as disqualified / out of range
@@ -1250,7 +1290,7 @@ const Views = {
       el.addEventListener(evtType, async () => {
         lead[key] = el.type === "number" ? parseFloat(el.value) || 0 : el.value;
         await persistLead(lead);
-        if (elId === "f-status" || elId === "f-state" || elId === "f-county" || elId === "f-businessName") Views.leadDetail(root, id);
+        if (["f-status", "f-state", "f-county", "f-businessName", "f-overageAmount"].includes(elId)) Views.leadDetail(root, id);
       });
     });
 
@@ -1611,6 +1651,27 @@ const Views = {
       </div>
 
       <div class="card mt-16">
+        <h2>Commission Rules</h2>
+        <p class="field-hint mt-0">
+          Your fee as a percentage of the overage. The whole amount earns one rate,
+          based on whether it's under or over $${COMMISSION_THRESHOLD.toLocaleString()}.
+          Each lead's commission shows in the Leads list, and totals show on the Dashboard.
+        </p>
+        <div class="form-grid">
+          <div class="form-row">
+            <label>Overages UNDER $${COMMISSION_THRESHOLD.toLocaleString()} — your %</label>
+            <input type="number" id="s-commissionPctUnder" min="0" max="100" step="0.5" value="${App.settings.commissionPctUnder || 0}"/>
+          </div>
+          <div class="form-row">
+            <label>Overages $${COMMISSION_THRESHOLD.toLocaleString()} AND OVER — your %</label>
+            <input type="number" id="s-commissionPctOver" min="0" max="100" step="0.5" value="${App.settings.commissionPctOver || 0}"/>
+          </div>
+        </div>
+        <button class="btn btn-primary mt-16" id="save-commission-btn">Save Commission Rules</button>
+        <span id="commission-saved" class="muted" style="margin-left:10px;"></span>
+      </div>
+
+      <div class="card mt-16">
         <h2>Backup Your Data</h2>
         <p class="field-hint mt-0">
           This app stores everything in this browser only. Download a backup regularly — especially before
@@ -1643,6 +1704,7 @@ const Views = {
 
     document.getElementById("save-settings-btn").addEventListener("click", async () => {
       const thresholds = {
+        ...App.settings,
         minAmount: parseFloat(document.getElementById("s-minAmount").value) || 0,
         minAgeMonths: parseFloat(document.getElementById("s-minAgeMonths").value) || 0,
         maxAgeYears: parseFloat(document.getElementById("s-maxAgeYears").value) || 0,
@@ -1651,6 +1713,19 @@ const Views = {
       await App.reloadAll();
       document.getElementById("settings-saved").textContent = "Saved ✓";
       setTimeout(() => { document.getElementById("settings-saved").textContent = ""; }, 2000);
+    });
+
+    document.getElementById("save-commission-btn").addEventListener("click", async () => {
+      const clampPct = (v) => Math.min(100, Math.max(0, parseFloat(v) || 0));
+      const thresholds = {
+        ...App.settings,
+        commissionPctUnder: clampPct(document.getElementById("s-commissionPctUnder").value),
+        commissionPctOver: clampPct(document.getElementById("s-commissionPctOver").value),
+      };
+      await DB.setSetting("thresholds", thresholds);
+      await App.reloadAll();
+      document.getElementById("commission-saved").textContent = "Saved ✓";
+      setTimeout(() => { document.getElementById("commission-saved").textContent = ""; }, 2000);
     });
 
     document.getElementById("export-btn").addEventListener("click", async () => {
