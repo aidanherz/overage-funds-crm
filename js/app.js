@@ -164,6 +164,50 @@ function anyCommissionConfigured() {
   return ruleHasValue(App.settings.commissionDefault) || (App.settings.commissionRules || []).some(ruleHasValue);
 }
 
+// Sort options offered on the Leads and Archived pages.
+const SORT_OPTIONS = [
+  { key: "commission-desc", label: "Commission: High → Low" },
+  { key: "commission-asc", label: "Commission: Low → High" },
+  { key: "amount-desc", label: "Overage Amount: High → Low" },
+  { key: "amount-asc", label: "Overage Amount: Low → High" },
+  { key: "date-desc", label: "Sale Date: Most Recent First" },
+  { key: "date-asc", label: "Sale Date: Oldest First" },
+];
+
+function sortLeads(leads, sortKey) {
+  const arr = leads.slice();
+  const amount = (l) => Number(l.overageAmount) || 0;
+  // Leads with no sale date sort to the bottom either way.
+  const dateVal = (l) => (l.saleDate ? new Date(l.saleDate + "T00:00:00").getTime() : null);
+  switch (sortKey) {
+    case "commission-asc": arr.sort((a, b) => commissionFor(a) - commissionFor(b)); break;
+    case "amount-desc": arr.sort((a, b) => amount(b) - amount(a)); break;
+    case "amount-asc": arr.sort((a, b) => amount(a) - amount(b)); break;
+    case "date-desc":
+    case "date-asc": {
+      const dir = sortKey === "date-desc" ? -1 : 1;
+      arr.sort((a, b) => {
+        const da = dateVal(a), db = dateVal(b);
+        if (da === null && db === null) return 0;
+        if (da === null) return 1;   // missing dates always last
+        if (db === null) return -1;
+        return (da - db) * dir;
+      });
+      break;
+    }
+    case "commission-desc":
+    default: arr.sort((a, b) => commissionFor(b) - commissionFor(a)); break;
+  }
+  return arr;
+}
+
+function sortDropdownHTML(selectedKey, selectId) {
+  return `
+    <select id="${selectId}">
+      ${SORT_OPTIONS.map((o) => `<option value="${o.key}" ${selectedKey === o.key ? "selected" : ""}>${o.label}</option>`).join("")}
+    </select>`;
+}
+
 const NAV_ITEMS = [
   { route: "dashboard", label: "Dashboard", icon: "▦" },
   { route: "upload", label: "Upload List", icon: "⬆" },
@@ -178,7 +222,8 @@ const App = {
   leads: [],
   resources: [],
   settings: { ...DEFAULT_SETTINGS },
-  leadsFilter: { state: null, county: null, status: "", search: "" },
+  leadsFilter: { state: null, county: null, status: "", search: "", sort: "commission-desc" },
+  archivedSort: "commission-desc",
   resourcesFilter: { state: null, county: null, formType: "" },
 
   async init() {
@@ -970,7 +1015,7 @@ const Views = {
         <button class="btn btn-primary mt-16" id="go-to-leads">View These Leads</button>
       `;
       document.getElementById("go-to-leads").addEventListener("click", () => {
-        App.leadsFilter = { state: ctx.state, county: ctx.county, status: "", search: "" };
+        App.leadsFilter = { state: ctx.state, county: ctx.county, status: "", search: "", sort: App.leadsFilter.sort || "commission-desc" };
         App.navigate("leads");
       });
     });
@@ -1019,10 +1064,13 @@ const Views = {
               </select>
               ${(f.state || f.county) ? `<button class="btn btn-sm" id="clear-location">Clear location filter</button>` : ""}
             </div>
-            <div class="flex-between mt-0" style="margin-bottom:8px;">
+            <div class="flex-between mt-0 wrap gap-8" style="margin-bottom:8px;">
               <span class="muted">${filtered.length} lead(s)${f.state ? ` in ${esc(f.county ? f.county + ", " : "")}${esc(f.state)}` : ""}</span>
+              <label style="display:flex;align-items:center;gap:6px;font-weight:400;color:var(--text-muted);margin:0;">
+                Sort by ${sortDropdownHTML(f.sort, "sort-select")}
+              </label>
             </div>
-            ${Views._leadsTable(filtered)}
+            ${Views._leadsTable(sortLeads(filtered, f.sort))}
           </div>
         </div>
       </div>
@@ -1037,6 +1085,10 @@ const Views = {
     });
     document.getElementById("status-filter").addEventListener("change", (e) => {
       App.leadsFilter.status = e.target.value;
+      Views.leadsList(root);
+    });
+    document.getElementById("sort-select").addEventListener("change", (e) => {
+      App.leadsFilter.sort = e.target.value;
       Views.leadsList(root);
     });
     const clearBtn = document.getElementById("clear-location");
@@ -1101,7 +1153,6 @@ const Views = {
 
   _leadsTable(leads) {
     if (leads.length === 0) return `<div class="empty-state">No leads match these filters.</div>`;
-    leads = leads.slice().sort((a, b) => (b.overageAmount || 0) - (a.overageAmount || 0));
     return `
       <table>
         <thead>
@@ -1151,10 +1202,7 @@ const Views = {
 
   // -------------------- ARCHIVED / OUT OF RANGE --------------------
   archived(root) {
-    const archivedLeads = App.leads
-      .filter((l) => l.isDisqualified)
-      .slice()
-      .sort((a, b) => (b.overageAmount || 0) - (a.overageAmount || 0));
+    const archivedLeads = sortLeads(App.leads.filter((l) => l.isDisqualified), App.archivedSort);
 
     root.innerHTML = `
       <div class="page-header">
@@ -1170,6 +1218,14 @@ const Views = {
         (currently ${App.settings.minAgeMonths} months) — no need to check manually.
         "Too old" and "too small" leads stay archived, since those don't change over time.
       </div>
+
+      ${archivedLeads.length > 0 ? `
+        <div class="flex-between wrap gap-8" style="margin-bottom:12px;">
+          <span class="muted">${archivedLeads.length} archived lead(s)</span>
+          <label style="display:flex;align-items:center;gap:6px;font-weight:400;color:var(--text-muted);margin:0;">
+            Sort by ${sortDropdownHTML(App.archivedSort, "archived-sort-select")}
+          </label>
+        </div>` : ""}
 
       <div class="card">
         ${archivedLeads.length === 0 ? `<div class="empty-state">Nothing archived right now.</div>` : `
@@ -1198,6 +1254,12 @@ const Views = {
       if (!confirm(`Permanently delete all ${archivedLeads.length} archived leads? This can't be undone.`)) return;
       for (const l of archivedLeads) await DB.deleteLead(l.id);
       await App.reloadAll();
+      Views.archived(root);
+    });
+
+    const archivedSortSel = document.getElementById("archived-sort-select");
+    if (archivedSortSel) archivedSortSel.addEventListener("change", (e) => {
+      App.archivedSort = e.target.value;
       Views.archived(root);
     });
 
