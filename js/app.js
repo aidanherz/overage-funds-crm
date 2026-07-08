@@ -79,8 +79,10 @@ const DEFAULT_SETTINGS = {
   minAmount: 1000,
   minAgeMonths: 6,
   maxAgeYears: 5,
-  commissionPctUnder: 0, // % of overage when amount is under $100k
-  commissionPctOver: 0,  // % of overage when amount is $100k or more
+  commissionPctUnder: 0, // legacy fields (kept for old backups); migrated below
+  commissionPctOver: 0,
+  commissionDefault: null,   // the fallback rule when no state/county rule matches
+  commissionRules: [],       // per-state and per-county rules
 };
 
 const COMMISSION_THRESHOLD = 100000;
@@ -88,14 +90,78 @@ const COMMISSION_THRESHOLD = 100000;
 // Statuses where the money has actually come in.
 const RECEIVED_STATUSES = ["Check Received", "Check Sent to Claimant", "Closed - Paid"];
 
-// Commission for one lead: the whole overage earns one rate, picked by
-// which side of the $100k line the amount falls on.
+// A commission rule can be a percentage of the overage or a flat dollar
+// fee, and either kind can vary by the $100k threshold.
+function normalizeCommRule(r = {}) {
+  return {
+    id: r.id || uid("comm"),
+    scope: r.scope || "state",          // "default" | "state" | "county"
+    state: r.state || "",
+    county: r.county || "",
+    feeType: r.feeType || "percentage", // "percentage" | "flat"
+    pctUnder: Number(r.pctUnder) || 0,
+    pctOver: Number(r.pctOver) || 0,
+    flatMode: r.flatMode || "single",   // "single" | "split"
+    flatSingle: Number(r.flatSingle) || 0,
+    flatUnder: Number(r.flatUnder) || 0,
+    flatOver: Number(r.flatOver) || 0,
+  };
+}
+
+function normText(s) { return String(s || "").trim().toLowerCase(); }
+
+// Pick the most specific rule for a lead: county → state → default.
+function findCommissionRule(lead) {
+  const rules = App.settings.commissionRules || [];
+  const byCounty = rules.find((r) =>
+    r.scope === "county" && normText(r.state) === normText(lead.state) && normText(r.county) === normText(lead.county));
+  if (byCounty) return byCounty;
+  const byState = rules.find((r) => r.scope === "state" && normText(r.state) === normText(lead.state));
+  if (byState) return byState;
+  return App.settings.commissionDefault || null;
+}
+
+function computeCommission(rule, amount) {
+  if (!rule) return 0;
+  if (rule.feeType === "flat") {
+    if (rule.flatMode === "split") {
+      return amount >= COMMISSION_THRESHOLD ? (rule.flatOver || 0) : (rule.flatUnder || 0);
+    }
+    return rule.flatSingle || 0;
+  }
+  const pct = amount >= COMMISSION_THRESHOLD ? (rule.pctOver || 0) : (rule.pctUnder || 0);
+  return amount * (pct / 100);
+}
+
 function commissionFor(lead) {
+  return computeCommission(findCommissionRule(lead), Number(lead.overageAmount) || 0);
+}
+
+// Human-readable explanation of how a lead's commission was figured out.
+function commissionInfo(lead) {
   const amt = Number(lead.overageAmount) || 0;
-  const pct = amt >= COMMISSION_THRESHOLD
-    ? (App.settings.commissionPctOver || 0)
-    : (App.settings.commissionPctUnder || 0);
-  return amt * (pct / 100);
+  const rule = findCommissionRule(lead);
+  const amount = computeCommission(rule, amt);
+  if (!rule) return { amount: 0, basis: "", source: "" };
+  const source = rule.scope === "county" ? `${rule.county}, ${rule.state} rule`
+    : rule.scope === "state" ? `${rule.state} rule`
+    : "default rate";
+  let basis;
+  if (rule.feeType === "flat") {
+    basis = rule.flatMode === "split"
+      ? `${fmtMoney(amount)} flat fee (${amt >= COMMISSION_THRESHOLD ? "over" : "under"} $${COMMISSION_THRESHOLD.toLocaleString()})`
+      : `${fmtMoney(amount)} flat fee`;
+  } else {
+    const pct = amt >= COMMISSION_THRESHOLD ? rule.pctOver : rule.pctUnder;
+    basis = `${pct}% of ${fmtMoney(amt)}`;
+  }
+  return { amount, basis, source };
+}
+
+// True if the user has actually set up any commission rate anywhere.
+function anyCommissionConfigured() {
+  const ruleHasValue = (r) => r && (r.pctUnder || r.pctOver || r.flatSingle || r.flatUnder || r.flatOver);
+  return ruleHasValue(App.settings.commissionDefault) || (App.settings.commissionRules || []).some(ruleHasValue);
 }
 
 const NAV_ITEMS = [
@@ -146,6 +212,19 @@ const App = {
     App.resources = await DB.getAllResources();
     const savedSettings = await DB.getSetting("thresholds", null);
     App.settings = savedSettings ? { ...DEFAULT_SETTINGS, ...savedSettings } : { ...DEFAULT_SETTINGS };
+
+    // Normalize commission config, migrating from the old percentage-only
+    // fields so existing setups (and backups) keep working.
+    if (!App.settings.commissionDefault) {
+      App.settings.commissionDefault = {
+        scope: "default",
+        feeType: "percentage",
+        pctUnder: App.settings.commissionPctUnder || 0,
+        pctOver: App.settings.commissionPctOver || 0,
+      };
+    }
+    App.settings.commissionDefault = normalizeCommRule({ ...App.settings.commissionDefault, scope: "default" });
+    App.settings.commissionRules = (App.settings.commissionRules || []).map(normalizeCommRule);
   },
 
   // Leads auto-flagged "too new" at import time should come back on their
@@ -305,7 +384,7 @@ const Views = {
     const commissionPotential = active
       .filter((l) => !RECEIVED_STATUSES.includes(l.status))
       .reduce((sum, l) => sum + commissionFor(l), 0);
-    const commissionConfigured = (App.settings.commissionPctUnder || 0) > 0 || (App.settings.commissionPctOver || 0) > 0;
+    const commissionConfigured = anyCommissionConfigured();
 
     const dueItems = [];
     active.forEach((l) => {
@@ -345,7 +424,7 @@ const Views = {
 
       ${!commissionConfigured ? `
         <div class="banner banner-info">
-          Commission tracking is on, but your rates aren't set yet — enter your percentages in
+          Commission tracking is on, but your rates aren't set yet — set them in
           <a href="#/settings">Settings → Commission Rules</a> and these numbers will fill in automatically.
         </div>` : ""}
 
@@ -1184,11 +1263,11 @@ const Views = {
                 <select id="f-listType">${LIST_TYPES.map((t) => `<option ${lead.listType === t ? "selected" : ""}>${esc(t)}</option>`).join("")}</select>
               </div>
             </div>
-            ${commissionFor(lead) > 0 ? `
+            ${commissionFor(lead) > 0 ? (() => { const ci = commissionInfo(lead); return `
               <div class="banner banner-success" style="margin:10px 0 0 0;">
-                Your commission on this lead: <strong>${fmtMoney(commissionFor(lead))}</strong>
-                (${(Number(lead.overageAmount) || 0) >= COMMISSION_THRESHOLD ? App.settings.commissionPctOver : App.settings.commissionPctUnder}% of ${fmtMoney(lead.overageAmount)})
-              </div>` : ""}
+                Your commission on this lead: <strong>${fmtMoney(ci.amount)}</strong>
+                &mdash; ${esc(ci.basis)} <span class="muted">(${esc(ci.source)})</span>
+              </div>`; })() : ""}
             <label style="display:flex;align-items:center;gap:6px;font-weight:400;color:var(--text);margin-top:10px;">
               <input type="checkbox" id="f-isDisqualified" style="width:auto;" ${lead.isDisqualified ? "checked" : ""}/>
               Mark as disqualified / out of range
@@ -1650,26 +1729,7 @@ const Views = {
         <span id="settings-saved" class="muted" style="margin-left:10px;"></span>
       </div>
 
-      <div class="card mt-16">
-        <h2>Commission Rules</h2>
-        <p class="field-hint mt-0">
-          Your fee as a percentage of the overage. The whole amount earns one rate,
-          based on whether it's under or over $${COMMISSION_THRESHOLD.toLocaleString()}.
-          Each lead's commission shows in the Leads list, and totals show on the Dashboard.
-        </p>
-        <div class="form-grid">
-          <div class="form-row">
-            <label>Overages UNDER $${COMMISSION_THRESHOLD.toLocaleString()} — your %</label>
-            <input type="number" id="s-commissionPctUnder" min="0" max="100" step="0.5" value="${App.settings.commissionPctUnder || 0}"/>
-          </div>
-          <div class="form-row">
-            <label>Overages $${COMMISSION_THRESHOLD.toLocaleString()} AND OVER — your %</label>
-            <input type="number" id="s-commissionPctOver" min="0" max="100" step="0.5" value="${App.settings.commissionPctOver || 0}"/>
-          </div>
-        </div>
-        <button class="btn btn-primary mt-16" id="save-commission-btn">Save Commission Rules</button>
-        <span id="commission-saved" class="muted" style="margin-left:10px;"></span>
-      </div>
+      <div class="card mt-16" id="commission-card"></div>
 
       <div class="card mt-16">
         <h2>Backup Your Data</h2>
@@ -1715,18 +1775,12 @@ const Views = {
       setTimeout(() => { document.getElementById("settings-saved").textContent = ""; }, 2000);
     });
 
-    document.getElementById("save-commission-btn").addEventListener("click", async () => {
-      const clampPct = (v) => Math.min(100, Math.max(0, parseFloat(v) || 0));
-      const thresholds = {
-        ...App.settings,
-        commissionPctUnder: clampPct(document.getElementById("s-commissionPctUnder").value),
-        commissionPctOver: clampPct(document.getElementById("s-commissionPctOver").value),
-      };
-      await DB.setSetting("thresholds", thresholds);
-      await App.reloadAll();
-      document.getElementById("commission-saved").textContent = "Saved ✓";
-      setTimeout(() => { document.getElementById("commission-saved").textContent = ""; }, 2000);
-    });
+    // Commission rules: build an editable working copy and render it.
+    Views._commDraft = {
+      default: normalizeCommRule({ ...App.settings.commissionDefault, scope: "default" }),
+      rules: (App.settings.commissionRules || []).map((r) => normalizeCommRule(r)),
+    };
+    Views._renderCommission();
 
     document.getElementById("export-btn").addEventListener("click", async () => {
       const data = await DB.exportAll();
@@ -1784,6 +1838,198 @@ const Views = {
     });
 
     Views._renderLoginStatus();
+  },
+
+  // ---------- Commission rules editor ----------
+  // Reads whatever inputs are currently on screen back into the working
+  // draft (called before any re-render, and before saving) so nothing
+  // the user typed is lost.
+  _captureCommission() {
+    const draft = Views._commDraft;
+    if (!draft) return;
+    const readInto = (rule, key) => {
+      const box = document.querySelector(`[data-comm-rule="${key}"]`);
+      if (!box) return;
+      const get = (field) => {
+        const el = box.querySelector(`[data-comm-field="${field}"]`);
+        return el ? el.value : undefined;
+      };
+      const num = (v, max) => {
+        let n = parseFloat(v);
+        if (isNaN(n) || n < 0) n = 0;
+        if (max != null && n > max) n = max;
+        return n;
+      };
+      if (get("scope") !== undefined) rule.scope = get("scope");
+      if (get("state") !== undefined) rule.state = get("state");
+      if (get("county") !== undefined) rule.county = get("county");
+      if (get("feeType") !== undefined) rule.feeType = get("feeType");
+      if (get("flatMode") !== undefined) rule.flatMode = get("flatMode");
+      if (get("pctUnder") !== undefined) rule.pctUnder = num(get("pctUnder"), 100);
+      if (get("pctOver") !== undefined) rule.pctOver = num(get("pctOver"), 100);
+      if (get("flatSingle") !== undefined) rule.flatSingle = num(get("flatSingle"));
+      if (get("flatUnder") !== undefined) rule.flatUnder = num(get("flatUnder"));
+      if (get("flatOver") !== undefined) rule.flatOver = num(get("flatOver"));
+    };
+    readInto(draft.default, "default");
+    draft.rules.forEach((r, i) => readInto(r, "r" + i));
+  },
+
+  _renderCommission() {
+    const card = document.getElementById("commission-card");
+    if (!card) return;
+    const draft = Views._commDraft;
+
+    card.innerHTML = `
+      <h2>Commission Rules</h2>
+      <p class="field-hint mt-0">
+        Set your fee as a <strong>percentage</strong> of the overage or a <strong>flat dollar amount</strong>.
+        Rules apply most-specific first: a matching <strong>county</strong> rule wins, otherwise the
+        <strong>state</strong> rule, otherwise your <strong>default</strong> below.
+        Each lead's commission shows in the Leads list, and totals show on the Dashboard.
+      </p>
+
+      <h3>Default rate <span class="muted" style="font-weight:400;">(used when no state or county rule matches)</span></h3>
+      <div data-comm-rule="default">${Views._commRuleFieldsHTML(draft.default, "default")}</div>
+
+      <h3 class="mt-16">State &amp; County rules</h3>
+      <div id="comm-rules-list">
+        ${draft.rules.length === 0
+          ? `<div class="empty-state" style="padding:16px;">No state or county rules yet. Add one below to override the default for a specific place.</div>`
+          : draft.rules.map((r, i) => `
+            <div class="card" style="box-shadow:none;background:#fafbfc;" data-comm-rule="r${i}">
+              <div class="flex-between" style="margin-bottom:10px;">
+                <strong>Rule ${i + 1}</strong>
+                <button class="btn btn-sm btn-danger comm-remove" data-idx="${i}">Remove</button>
+              </div>
+              <div class="form-grid">
+                <div class="form-row">
+                  <label>Applies to</label>
+                  <select data-comm-field="scope" class="comm-structural">
+                    <option value="state" ${r.scope === "state" ? "selected" : ""}>A whole state</option>
+                    <option value="county" ${r.scope === "county" ? "selected" : ""}>A specific county</option>
+                  </select>
+                </div>
+                <div class="form-row">
+                  <label>State</label>
+                  <select data-comm-field="state">
+                    <option value="">Select a state…</option>
+                    ${US_STATES.map((s) => `<option value="${esc(s)}" ${r.state === s ? "selected" : ""}>${esc(s)}</option>`).join("")}
+                  </select>
+                </div>
+                ${r.scope === "county" ? `
+                  <div class="form-row">
+                    <label>County</label>
+                    <input type="text" data-comm-field="county" value="${esc(r.county)}" placeholder="e.g. Fulton"/>
+                  </div>` : ""}
+              </div>
+              ${Views._commRuleFieldsHTML(r, "r" + i)}
+            </div>
+          `).join("")}
+      </div>
+      <button class="btn mt-8" id="comm-add-rule">+ Add a State/County Rule</button>
+
+      <div class="mt-16">
+        <button class="btn btn-primary" id="save-commission-btn">Save Commission Rules</button>
+        <span id="commission-saved" class="muted" style="margin-left:10px;"></span>
+      </div>
+    `;
+
+    // Structural changes: capture current values, mutate draft, re-render.
+    card.querySelectorAll(".comm-structural, [data-comm-field='feeType'], [data-comm-field='flatMode'], [data-comm-field='scope']").forEach((el) => {
+      el.addEventListener("change", () => {
+        Views._captureCommission();
+        Views._renderCommission();
+      });
+    });
+
+    card.querySelectorAll(".comm-remove").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        Views._captureCommission();
+        draft.rules.splice(parseInt(btn.dataset.idx, 10), 1);
+        Views._renderCommission();
+      });
+    });
+
+    const addBtn = document.getElementById("comm-add-rule");
+    if (addBtn) addBtn.addEventListener("click", () => {
+      Views._captureCommission();
+      draft.rules.push(normalizeCommRule({ scope: "state" }));
+      Views._renderCommission();
+    });
+
+    document.getElementById("save-commission-btn").addEventListener("click", async () => {
+      Views._captureCommission();
+      const invalid = draft.rules.find((r) => !r.state || (r.scope === "county" && !r.county));
+      if (invalid) {
+        alert("Every state/county rule needs a State selected (and a County, for county rules). Please complete or remove any blank rule.");
+        return;
+      }
+      const thresholds = {
+        ...App.settings,
+        commissionDefault: draft.default,
+        commissionRules: draft.rules,
+      };
+      await DB.setSetting("thresholds", thresholds);
+      await App.reloadAll();
+      Views._commDraft = {
+        default: normalizeCommRule({ ...App.settings.commissionDefault, scope: "default" }),
+        rules: (App.settings.commissionRules || []).map((r) => normalizeCommRule(r)),
+      };
+      Views._renderCommission();
+      const saved = document.getElementById("commission-saved");
+      if (saved) { saved.textContent = "Saved ✓"; setTimeout(() => { saved.textContent = ""; }, 2000); }
+    });
+  },
+
+  // The fee-type portion of a rule editor (shared by default + custom rules).
+  _commRuleFieldsHTML(rule, key) {
+    const th = COMMISSION_THRESHOLD.toLocaleString();
+    const feeTypeRow = `
+      <div class="form-row">
+        <label>Fee type</label>
+        <select data-comm-field="feeType">
+          <option value="percentage" ${rule.feeType === "percentage" ? "selected" : ""}>Percentage of overage</option>
+          <option value="flat" ${rule.feeType === "flat" ? "selected" : ""}>Flat dollar fee</option>
+        </select>
+      </div>`;
+
+    if (rule.feeType === "flat") {
+      const modeRow = `
+        <div class="form-row">
+          <label>Flat fee style</label>
+          <select data-comm-field="flatMode">
+            <option value="single" ${rule.flatMode === "single" ? "selected" : ""}>One amount for any overage</option>
+            <option value="split" ${rule.flatMode === "split" ? "selected" : ""}>Two amounts (split at $${th})</option>
+          </select>
+        </div>`;
+      const amountRows = rule.flatMode === "split" ? `
+        <div class="form-row">
+          <label>Flat fee — overages UNDER $${th}</label>
+          <input type="number" data-comm-field="flatUnder" min="0" step="100" value="${rule.flatUnder || 0}"/>
+        </div>
+        <div class="form-row">
+          <label>Flat fee — overages $${th} AND OVER</label>
+          <input type="number" data-comm-field="flatOver" min="0" step="100" value="${rule.flatOver || 0}"/>
+        </div>` : `
+        <div class="form-row">
+          <label>Flat fee amount ($)</label>
+          <input type="number" data-comm-field="flatSingle" min="0" step="100" value="${rule.flatSingle || 0}"/>
+        </div>`;
+      return `<div class="form-grid">${feeTypeRow}${modeRow}${amountRows}</div>`;
+    }
+
+    return `<div class="form-grid">
+      ${feeTypeRow}
+      <div class="form-row">
+        <label>Overages UNDER $${th} — your %</label>
+        <input type="number" data-comm-field="pctUnder" min="0" max="100" step="0.5" value="${rule.pctUnder || 0}"/>
+      </div>
+      <div class="form-row">
+        <label>Overages $${th} AND OVER — your %</label>
+        <input type="number" data-comm-field="pctOver" min="0" max="100" step="0.5" value="${rule.pctOver || 0}"/>
+      </div>
+    </div>`;
   },
 
   async _renderLoginStatus() {
