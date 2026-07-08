@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Overage Funds CRM</title>
+<link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+<div id="app-shell" style="display:none;">
+  <nav id="sidebar">
+    <div class="brand">Overage Funds CRM
+      <small>Tax sale surplus tracker</small>
+    </div>
+    <div id="nav-links"></div>
+    <div class="sidebar-footer">
+      Your data is stored in this browser.<br/>
+      Back it up from Settings.
+    </div>
+  </nav>
+  <main id="main">
+    <div id="app-root"></div>
+  </main>
+</div>
+
+<div id="login-screen" style="display:none;">
+  <div class="login-box">
+    <h1>Overage Funds CRM</h1>
+    <p>Please sign in to continue.</p>
+    <div class="form-row">
+      <label>Username</label>
+      <input type="text" id="login-username" autocomplete="username" />
+    </div>
+    <div class="form-row">
+      <label>Password</label>
+      <input type="password" id="login-password" autocomplete="current-password" />
+    </div>
+    <button class="btn btn-primary" id="login-submit" style="width:100%;justify-content:center;">Sign In</button>
+    <div class="error" id="login-error"></div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="js/db.js"></script>
+<script src="js/parser.js"></script>
+<script src="js/auth.js"></script>
+<script src="js/seed.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
