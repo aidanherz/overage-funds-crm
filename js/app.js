@@ -516,36 +516,102 @@ const Views = {
         line.items.push({ x, width: item.width || 0, str: item.str });
       });
 
-      // Top of page first, then left-to-right within each line.
+      // Within each line, merge words separated by small gaps into cells.
       lines.sort((a, b) => b.y - a.y);
+      const pageLines = [];
       lines.forEach((line) => {
         line.items.sort((a, b) => a.x - b.x);
         const cells = [];
         let current = null;
-        let prevEnd = null;
         line.items.forEach((it) => {
-          if (current !== null && prevEnd !== null && it.x - prevEnd < 10) {
-            current += (current.endsWith(" ") || it.str.startsWith(" ") ? "" : " ") + it.str;
+          if (current !== null && it.x - (current.x + current.width) < 10) {
+            const joiner = current.str.endsWith(" ") || it.str.startsWith(" ") ? "" : " ";
+            current.str += joiner + it.str;
+            current.width = it.x + it.width - current.x;
           } else {
-            if (current !== null) cells.push(current.trim());
-            current = it.str;
+            if (current !== null) cells.push(current);
+            current = { x: it.x, width: it.width, str: it.str };
           }
-          prevEnd = it.x + it.width;
         });
-        if (current !== null) cells.push(current.trim());
-        if (cells.length > 0) allRows.push(cells);
+        if (current !== null) cells.push(current);
+        if (cells.length > 0) pageLines.push(cells);
+      });
+
+      // Work out where the table's columns actually sit on the page by
+      // clustering the left edges of all cells. A cell then lands in the
+      // column whose position it matches — so a row with an empty cell
+      // no longer shifts everything after it into the wrong column.
+      const starts = [];
+      pageLines.forEach((cells) => cells.forEach((c) => starts.push(c.x)));
+      starts.sort((a, b) => a - b);
+      const clusters = [];
+      starts.forEach((x) => {
+        const cluster = clusters.find((cl) => Math.abs(cl.center - x) <= 12);
+        if (cluster) {
+          cluster.count++;
+          cluster.center += (x - cluster.center) / cluster.count;
+        } else {
+          clusters.push({ center: x, count: 1 });
+        }
+      });
+      const minCount = Math.max(3, Math.floor(pageLines.length * 0.15));
+      let columns = clusters.filter((cl) => cl.count >= minCount).map((cl) => cl.center).sort((a, b) => a - b);
+      if (columns.length < 2) columns = clusters.map((cl) => cl.center).sort((a, b) => a - b);
+
+      pageLines.forEach((cells) => {
+        const row = new Array(columns.length).fill("");
+        cells.forEach((c) => {
+          let best = 0;
+          let bestDist = Infinity;
+          columns.forEach((center, i) => {
+            const dist = Math.abs(center - c.x);
+            if (dist < bestDist) { bestDist = dist; best = i; }
+          });
+          row[best] = row[best] ? row[best] + " " + c.str.trim() : c.str.trim();
+        });
+        if (row.some((cell) => cell !== "")) allRows.push(row);
       });
     }
 
-    // Keep only rows that look like table rows (2+ columns), and pad
-    // them all to the same width so the mapping screen lines up.
-    const tableRows = allRows.filter((r) => r.length >= 2);
+    // Keep only rows that look like table rows (2+ filled columns), and
+    // pad them all to the same width so the mapping screen lines up.
+    const tableRows = allRows.filter((r) => r.filter((c) => c !== "").length >= 2);
     if (tableRows.length < 2) throw new Error("No table structure found in PDF");
     const width = Math.max(...tableRows.map((r) => r.length));
-    return tableRows.map((r) => {
+    let grid = tableRows.map((r) => {
       while (r.length < width) r.push("");
       return r;
     });
+
+    // Merge adjacent columns that are (almost) never filled on the same
+    // row — usually a header sitting slightly offset from its data.
+    let didMerge = true;
+    while (didMerge) {
+      didMerge = false;
+      const w = grid[0].length;
+      for (let i = 0; i < w - 1; i++) {
+        const bothFilled = grid.filter((r) => r[i] !== "" && r[i + 1] !== "").length;
+        const leftFilled = grid.filter((r) => r[i] !== "").length;
+        const rightFilled = grid.filter((r) => r[i + 1] !== "").length;
+        if (leftFilled > 0 && rightFilled > 0 && bothFilled <= Math.max(1, Math.floor(grid.length * 0.02))) {
+          grid = grid.map((r) => {
+            const mergedCell = r[i] && r[i + 1] ? r[i] + " " + r[i + 1] : (r[i] || r[i + 1]);
+            const copy = r.slice();
+            copy.splice(i, 2, mergedCell);
+            return copy;
+          });
+          didMerge = true;
+          break;
+        }
+      }
+    }
+
+    // Drop columns that ended up empty in every row.
+    const keep = [];
+    for (let i = 0; i < grid[0].length; i++) {
+      if (grid.some((r) => r[i] !== "")) keep.push(i);
+    }
+    return grid.map((r) => keep.map((i) => r[i]));
   },
 
   _renderMapping(filename, rows, ctx) {
@@ -565,7 +631,26 @@ const Views = {
         <table class="mapping-table">
           <thead><tr><th>We need</th><th>Use this column from your file</th></tr></thead>
           <tbody>
-            ${Parser.TARGET_FIELDS.map((f) => `
+            ${Parser.TARGET_FIELDS.map((f) => {
+              // Some counties split the owner's name across several
+              // columns (First / Middle / Last) — offer extra dropdowns
+              // for the name so the pieces get joined back together.
+              let extraSelects = "";
+              if (f.key === "formerOwnerName") {
+                const guessMiddle = headers.find((h) => /middle/i.test(h)) || "";
+                const guessLast = headers.find((h) => /last\s*name/i.test(h)) || "";
+                const nameAppendSelect = (n, guess) => `
+                  <select data-append="${n}" class="map-append" style="margin-top:6px;">
+                    <option value="">— No extra name column —</option>
+                    ${headers.map((h) => `<option value="${esc(h)}" ${guess === h ? "selected" : ""}>${esc(h)}</option>`).join("")}
+                  </select>`;
+                const showExtras = /first/i.test(guessed[f.key] || "") || guessMiddle || guessLast;
+                extraSelects = showExtras
+                  ? nameAppendSelect(1, guessMiddle) + nameAppendSelect(2, guessLast) +
+                    `<div class="field-hint">If the name is split across columns (First / Middle / Last), pick the extra pieces here and they'll be joined together.</div>`
+                  : "";
+              }
+              return `
               <tr>
                 <td>${esc(f.label)}${f.required ? " <span style='color:#c0392b'>*</span>" : ""}</td>
                 <td>
@@ -573,9 +658,10 @@ const Views = {
                     <option value="">— Not in this file —</option>
                     ${headers.map((h) => `<option value="${esc(h)}" ${guessed[f.key] === h ? "selected" : ""}>${esc(h)}</option>`).join("")}
                   </select>
+                  ${extraSelects}
                 </td>
               </tr>
-            `).join("")}
+            `;}).join("")}
           </tbody>
         </table>
 
@@ -602,6 +688,10 @@ const Views = {
       section.querySelectorAll(".map-select").forEach((sel) => {
         mapping[sel.dataset.field] = sel.value;
       });
+      const nameAppends = [];
+      section.querySelectorAll(".map-append").forEach((sel) => {
+        if (sel.value && sel.value !== mapping.formerOwnerName) nameAppends.push(sel.value);
+      });
 
       const missingRequired = Parser.TARGET_FIELDS.filter((f) => f.required && !mapping[f.key]);
       if (missingRequired.length) {
@@ -611,6 +701,27 @@ const Views = {
 
       const headerIndex = {};
       headers.forEach((h, i) => (headerIndex[h] = i));
+
+      // Safety net: dry-run the whole file first. If most rows have no
+      // readable sale date AND no readable amount, something is wrong
+      // with the file or the column mapping — stop and say so instead
+      // of importing garbage that all lands in the archive.
+      let unreadableCount = 0;
+      for (const r of dataRows) {
+        const get = (key) => (mapping[key] ? r[headerIndex[mapping[key]]] : "");
+        const d = Parser.parseDate(get("saleDate"));
+        const a = Parser.parseAmount(get("overageAmount"));
+        if (d === null && a === null) unreadableCount++;
+      }
+      if (dataRows.length >= 3 && unreadableCount / dataRows.length > 0.6) {
+        alert(
+          "Import stopped — nothing was imported.\n\n" +
+          `We couldn't read a sale date or dollar amount on ${unreadableCount} of ${dataRows.length} rows. ` +
+          "That usually means the wrong columns are selected in Step 3, or the file didn't read correctly.\n\n" +
+          "Check the column dropdowns and the preview table, then try Import again."
+        );
+        return;
+      }
 
       let imported = 0, disqualifiedCount = 0;
       const reasonCounts = {};
@@ -638,7 +749,8 @@ const Views = {
           parcelNumber: get("parcelNumber"),
           saleDate: saleDateISO || "",
           overageAmount: amount == null ? 0 : amount,
-          formerOwnerName: get("formerOwnerName"),
+          formerOwnerName: [get("formerOwnerName"), ...nameAppends.map((h) => r[headerIndex[h]] || "")]
+            .map((s) => String(s).trim()).filter(Boolean).join(" "),
           status: "New",
           nextAction: evalResult.inRange ? "Begin research" : "",
           responsible: "",
@@ -884,6 +996,7 @@ const Views = {
           <h1>Archived / Out of Range</h1>
           <p class="subtitle">Leads that didn't meet your rules (too new, too old, or too small) live here, separate from your active pipeline.</p>
         </div>
+        ${archivedLeads.length > 0 ? `<button class="btn btn-danger" id="delete-all-archived">Delete All ${archivedLeads.length} Archived</button>` : ""}
       </div>
 
       <div class="banner banner-info">
@@ -913,6 +1026,14 @@ const Views = {
         </table>`}
       </div>
     `;
+
+    const deleteAllBtn = document.getElementById("delete-all-archived");
+    if (deleteAllBtn) deleteAllBtn.addEventListener("click", async () => {
+      if (!confirm(`Permanently delete all ${archivedLeads.length} archived leads? This can't be undone.`)) return;
+      for (const l of archivedLeads) await DB.deleteLead(l.id);
+      await App.reloadAll();
+      Views.archived(root);
+    });
 
     root.querySelectorAll("td.clickable").forEach((td) => {
       td.addEventListener("click", () => App.navigate("lead/" + td.dataset.id));
